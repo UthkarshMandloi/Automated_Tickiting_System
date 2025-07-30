@@ -1,0 +1,25 @@
+# Ignore Google API token file
+token.json
+
+# Ignore Google API client secret file
+credentials.json
+
+# Ignore Config file for persinal info
+config.py
+
+# Ignore virtual environment folder
+venv/
+
+# Ignore temporary files created by the script
+temp/
+
+# Ignore .DS_Store on macOS (if collaborating with Mac users)
+.DS_Store
+
+# Ignore IDE-specific files (e.g., for VS Code)
+.vscode/
+
+# Ignore common Python compiled files
+__pycache__/
+*.pyc
+*.ipynb_checkpoints/
