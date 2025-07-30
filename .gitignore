@@ -5,7 +5,7 @@ token.json
 credentials.json
 
 # Ignore Config file for persinal info
-# Config.py
+Config.py
 
 # Ignore virtual environment folder
 venv/
