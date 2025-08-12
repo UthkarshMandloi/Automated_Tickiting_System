@@ -3,12 +3,13 @@
 #
 # This script automates the entire event ticketing process:
 # 1. Reads attendee data from a Google Sheet.
-# 2. Generates a unique pre-filled Google Form link for each attendee.
-# 3. Creates a QR code from this link.
-# 4. Personalizes a ticket image with the attendee's name and the QR code.
-# 5. Uploads the generated files to specific Google Drive folders.
-# 6. Sends the personalized ticket via email to the attendee.
-# 7. Updates the Google Sheet with the processing status ("Generated", "Sent", "Failed").
+# 2. Checks MongoDB for existing attendees by a composite key (email + name) to prevent duplicates.
+# 3. Generates a unique ID for new attendees and stores it in MongoDB.
+# 4. Creates a QR code from this unique ID.
+# 5. Personalizes a ticket image with the attendee's name and the QR code.
+# 6. Uploads the generated files to specific Google Drive folders.
+# 7. Sends the personalized ticket via email to the attendee.
+# 8. Updates the Google Sheet with the processing status ("Generated", "Sent", "Failed").
 # It runs in a continuous loop to process new entries as they appear.
 #
 # -----------------------------------------------------------------------------
@@ -18,6 +19,7 @@
 # =============================================================================
 import os
 import time
+import uuid
 import qrcode
 import smtplib
 import importlib
@@ -36,6 +38,7 @@ from email.mime.image import MIMEImage
 # Custom modules (ensure these files are in the same directory)
 import config
 from google_auth import authenticate_google_api
+from mongo_helper import MongoDBClient
 
 # Optional: Tesseract for OCR-based placeholder detection
 try:
@@ -55,6 +58,7 @@ except ImportError:
 PROCESSED_ENTRIES = set()
 COLUMN_INDICES = {}
 APPLICATION_SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+mongo_client = MongoDBClient() # Initialize MongoDB client
 
 ###
 # --- Utility Functions ---
@@ -79,15 +83,17 @@ def get_sheet_data(sheets_service, spreadsheet_id: str, data_range: str) -> tupl
         print(f"❌ An error occurred while fetching sheet data: {error}")
         return [], []
 
-def update_sheet_cell(sheets_service, spreadsheet_id: str, sheet_name: str, row_index: int, col_index: int, value: str):
-    """Updates a single cell in the Google Sheet."""
+def update_sheet_cell(sheets_service, spreadsheet_id: str, sheet_name: str, row_index: int, col_index: int, value: str) -> bool:
+    """Updates a single cell in the Google Sheet and returns True on success."""
     range_name = f"{sheet_name}!{chr(ord('A') + col_index)}{row_index + 2}"
     body = {'values': [[value]]}
     try:
         sheets_service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_name, valueInputOption='RAW', body=body).execute()
         print(f"✅ Sheet updated: Cell '{range_name}' set to '{value}'")
+        return True
     except HttpError as error:
         print(f"❌ Error updating cell {range_name}: {error}")
+        return False
 
 def upload_file_to_drive(drive_service, file_path: str, folder_id: str, file_name: str) -> str | None:
     """Uploads a file to a specified Google Drive folder."""
@@ -133,12 +139,7 @@ def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
         text_width = text_bbox[2] - text_bbox[0]
         text_x = (base_img.width - text_width) / 2
         text_y = config.DETECTED_NAME_TEXT_Y_POS
-        
-        # Adjust the bounding box to the final calculated position
-        final_bbox = (text_x, text_y, text_x + text_width, text_y + (text_bbox[3] - text_bbox[1]))
-
         draw.text((text_x, text_y), name, font=font, fill=config.TEXT_COLOR)
-        draw.rectangle(final_bbox, outline="red", width=3) # <<< ADD THIS LINE FOR DEBUGGING
 
         # Position and paste QR code (centered horizontally)
         qr_img = Image.open(qr_code_path).convert("RGBA")
@@ -186,7 +187,8 @@ def get_value_safe(row: list, col_idx: int) -> str:
 ###
 # --- Main Execution Logic ---
 ###
-if __name__ == '__main__':
+def main():
+    """Main function to run the ticketing automation loop."""
     print("--- 🚀 Event Ticketing Automation System ---")
 
     # On startup, reload config in case it was modified by OCR
@@ -220,8 +222,14 @@ if __name__ == '__main__':
                 time.sleep(config.POLLING_INTERVAL_SECONDS)
                 continue
 
-            # Dynamically map column names to indices
-            for col_name in [config.COL_NAME, config.COL_EMAIL, config.COL_TICKET_STATUS, config.COL_EMAIL_STATUS]:
+            required_columns = [
+                config.COL_NAME, 
+                config.COL_EMAIL, 
+                config.COL_TICKET_STATUS, 
+                config.COL_EMAIL_STATUS,
+                "Attendee ID" 
+            ]
+            for col_name in required_columns:
                 if col_name not in headers:
                     print(f"❌ CRITICAL: Column '{col_name}' not found in sheet. Exiting.")
                     exit(1)
@@ -241,8 +249,7 @@ if __name__ == '__main__':
                 if not name or not email:
                     continue # Skip empty or malformed rows
 
-                # A unique ID for the entry to avoid re-processing in the same run
-                row_unique_id = f"{get_value_safe(row, 0).strip()}-{email}"
+                row_unique_id = f"{name}-{email}"
 
                 if ticket_status == "Sent" or row_unique_id in PROCESSED_ENTRIES:
                     continue # Skip already processed entries
@@ -251,42 +258,77 @@ if __name__ == '__main__':
                 PROCESSED_ENTRIES.add(row_unique_id)
                 os.makedirs("temp", exist_ok=True) # Ensure temp folder exists
 
-                # 1. Update status to 'Generating...'
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Generating...")
 
-                # 2. Generate pre-filled link & QR code
-                prefilled_link = config.PREFILLED_FORM_BASE_LINK.format(name_param=quote_plus(name), status_param="Attended")
+                # --- MODIFIED: Transactional logic to update sheet before database ---
+                attendee_id = None
+                existing_attendee = mongo_client.find_attendee_by_email_and_name(email, name)
+
+                if existing_attendee:
+                    print(f"↪️ Found existing attendee in DB for email: {email} and name: {name}")
+                    attendee_id = existing_attendee.get("attendee_id")
+                    sheet_attendee_id = get_value_safe(row, COLUMN_INDICES["Attendee ID"]).strip()
+                    if sheet_attendee_id != attendee_id:
+                        print(f"⚠️ Sheet has incorrect ID. Updating sheet with correct ID: {attendee_id}")
+                        update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES["Attendee ID"], attendee_id)
+                else:
+                    print(f"➕ No existing attendee found for {email} and {name}. Creating new entry.")
+                    attendee_id = str(uuid.uuid4())
+                    
+                    # Step 1: Attempt to write the new ID to the sheet first.
+                    id_update_success = update_sheet_cell(
+                        sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, 
+                        i, COLUMN_INDICES["Attendee ID"], attendee_id
+                    )
+
+                    # Step 2: Only if the sheet update was successful, insert into the database.
+                    if id_update_success:
+                        try:
+                            full_attendee_data = {header: get_value_safe(row, idx) for idx, header in enumerate(headers)}
+                            full_attendee_data['attendee_id'] = attendee_id
+                            
+                            # --- FIX: Explicitly set initial statuses for the database entry ---
+                            full_attendee_data[config.COL_TICKET_STATUS] = 'Issued'
+                            full_attendee_data[config.COL_EMAIL_STATUS] = 'Pending'
+                            
+                            mongo_client.insert_full_attendee(full_attendee_data)
+                            print(f"✅ New attendee '{name}' inserted into MongoDB with ID: {attendee_id}")
+                        except Exception as e:
+                            print(f"❌ Error inserting new attendee '{name}' into MongoDB: {e}")
+                            update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (DB)")
+                            continue
+                    else:
+                        # If the sheet update failed, abort this record.
+                        print(f"❌ Aborting processing for '{name}' due to sheet update failure.")
+                        update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (Sheet)")
+                        continue
+                
                 qr_filename = f"{name.replace(' ', '_')}_QR.png"
                 qr_path = os.path.join("temp", qr_filename)
-                if not generate_qr_code(prefilled_link, qr_path, config.DETECTED_QR_CODE_TARGET_SIZE):
+                if not generate_qr_code(attendee_id, qr_path, config.DETECTED_QR_CODE_TARGET_SIZE):
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (QR)")
                     continue
 
-                # 3. Create Ticket Image
                 ticket_filename = f"{name.replace(' ', '_')}_Ticket.png"
                 ticket_path = os.path.join("temp", ticket_filename)
                 if not create_ticket_image(ticket_path, name, qr_path):
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (Image)")
                     continue
 
-                # 4. Upload files to Drive
                 upload_file_to_drive(drive_service, qr_path, config.QR_CODES_FOLDER_ID, qr_filename)
                 upload_file_to_drive(drive_service, ticket_path, config.TICKETS_FOLDER_ID, ticket_filename)
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Generated")
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Sending...")
 
-                # 5. Send Email
                 if send_ticket_email(email, name, ticket_path):
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Sent")
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Sent")
                 else:
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Failed (Email)")
 
-                # 6. Clean up temp files
                 os.remove(qr_path)
                 os.remove(ticket_path)
                 print(f"✅ Cleaned up temp files for {name}.")
-
 
             time.sleep(config.POLLING_INTERVAL_SECONDS)
 
@@ -307,45 +349,49 @@ def test_single_ticket_generation():
     A standalone function to test only the image generation logic.
     It uses local files and does not require any API connections.
     This is useful for quickly verifying the template, font, and positioning.
-    
-    To run this test:
-    1. Uncomment the lines at the very bottom of this script.
-    2. Make sure you have 'template.png', 'qr.png', and 'Poppins-Bold.ttf' in your directory.
-    3. Run the script: python your_script_name.py
     """
     print("\n--- 🧪 Running Standalone Image Generation Test ---")
 
     try:
         # --- Configuration (Local for this test) ---
         template_path = "template.png"
-        qr_code_path = "qr.png"
-        font_path = "Poppins-Bold.ttf"
+        qr_code_path = "qr.png" # Make sure you have a dummy qr.png for this test
+        font_path = "Poppins-Bold.ttf" # Make sure you have this font file
         output_path = "test_final_output.png"
         
         name = "Uthkarsh Mandloi"
         font_size = 60
-        text_position = (850, 750)  # (x, y) - Manually set for the test
+        # Manually set positions for the test. Adjust these to match your template.
+        text_position_y = 750 
+        qr_position_y = 950 
         qr_size = 350
-        qr_position = (785, 950) # (x, y) - Manually set for the test
 
         # --- Test Logic ---
         print(f"Loading template: {template_path}")
-        template = Image.open(template_path).convert("RGBA")
+        base_img = Image.open(template_path).convert("RGBA")
+        draw = ImageDraw.Draw(base_img)
 
         print(f"Loading and resizing QR code: {qr_code_path}")
         qr_code = Image.open(qr_code_path).convert("RGBA")
         qr_code = qr_code.resize((qr_size, qr_size))
 
+        # Center QR code horizontally
+        qr_pos_x = (base_img.width - qr_code.width) / 2
         print("Pasting QR code onto template...")
-        template.paste(qr_code, qr_position, qr_code)
+        base_img.paste(qr_code, (int(qr_pos_x), qr_position_y), qr_code)
 
         print("Drawing text on image...")
-        draw = ImageDraw.Draw(template)
         font = ImageFont.truetype(font_path, font_size)
-        draw.text(text_position, name, font=font, fill=(0, 0, 0, 255)) # Black text
+        
+        # Center text horizontally
+        text_bbox = draw.textbbox((0, 0), name, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_pos_x = (base_img.width - text_width) / 2
+        
+        draw.text((text_pos_x, text_position_y), name, font=font, fill=(0, 0, 0, 255)) # Black text
 
         print(f"Saving final image to: {output_path}")
-        template.save(output_path)
+        base_img.save(output_path)
 
         print(f"✅✅✅ Test successful! Image generated and saved as '{output_path}'.")
 
@@ -355,6 +401,16 @@ def test_single_ticket_generation():
         print(f"❌ TEST FAILED: An unexpected error occurred: {e}")
 
 
-# --- To run the standalone test, uncomment the two lines below ---
-# if __name__ == '__main__':
-#     test_single_ticket_generation()
+# =============================================================================
+#  Part 4: Script Execution
+# =============================================================================
+
+if __name__ == '__main__':
+    # --- CHOOSE WHICH FUNCTION TO RUN ---
+    
+    # To run the main application that polls the Google Sheet, call main()
+    main()
+
+    # To run ONLY the standalone image generation test, comment out main()
+    # and uncomment the line below.
+    # test_single_ticket_generation()
