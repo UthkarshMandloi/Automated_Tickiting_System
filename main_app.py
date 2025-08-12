@@ -1,17 +1,9 @@
 # -----------------------------------------------------------------------------
-# Event Ticketing Automation System
+# Event Ticketing Automation System (Server Ready)
 #
-# This script automates the entire event ticketing process:
-# 1. Reads attendee data from a Google Sheet.
-# 2. Checks MongoDB for existing attendees by a composite key (email + name) to prevent duplicates.
-# 3. Generates a unique ID for new attendees and stores it in MongoDB.
-# 4. Creates a QR code from this unique ID.
-# 5. Personalizes a ticket image with the attendee's name and the QR code.
-# 6. Uploads the generated files to specific Google Drive folders.
-# 7. Sends the personalized ticket via email to the attendee.
-# 8. Updates the Google Sheet with the processing status ("Generated", "Sent", "Failed").
-# It runs in a continuous loop to process new entries as they appear.
-#
+# This script is now configured to run on a server using Google Service Account
+# credentials for authentication, removing the need for browser-based login.
+# It can download assets like templates and fonts directly from URLs.
 # -----------------------------------------------------------------------------
 
 # =============================================================================
@@ -23,12 +15,17 @@ import uuid
 import qrcode
 import smtplib
 import importlib
-from urllib.parse import quote_plus
+import json
+import requests
+from urllib.parse import quote_plus, urlparse
 from PIL import Image, ImageDraw, ImageFont
 
 # Google API client and errors
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
 
 # Email components
 from email.mime.multipart import MIMEMultipart
@@ -37,7 +34,6 @@ from email.mime.image import MIMEImage
 
 # Custom modules (ensure these files are in the same directory)
 import config
-from google_auth import authenticate_google_api
 from mongo_helper import MongoDBClient
 
 # Optional: Tesseract for OCR-based placeholder detection
@@ -57,12 +53,32 @@ except ImportError:
 # --- Global Application State & Constants ---
 PROCESSED_ENTRIES = set()
 COLUMN_INDICES = {}
-APPLICATION_SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 mongo_client = MongoDBClient() # Initialize MongoDB client
 
 ###
 # --- Utility Functions ---
 ###
+
+def download_file(url, local_filename):
+    """Downloads a file from a URL to a local path."""
+    try:
+        if "drive.google.com" in url:
+            file_id = url.split('/d/')[1].split('/')[0]
+            download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
+        else:
+            download_url = url
+
+        with requests.get(download_url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        print(f"✅ Successfully downloaded '{local_filename}' from URL.")
+        return local_filename
+    except Exception as e:
+        print(f"❌ Error downloading file from {url}: {e}")
+        return None
+
 
 def get_spreadsheet_id_from_url(url: str) -> str:
     """Extracts the Google Spreadsheet ID from its URL."""
@@ -70,6 +86,21 @@ def get_spreadsheet_id_from_url(url: str) -> str:
         return url.split('/d/')[1].split('/')[0]
     except IndexError:
         raise ValueError(f"Invalid Google Sheet URL: '{url}'. Could not extract Spreadsheet ID.")
+
+def get_folder_id_from_url(url: str) -> str:
+    """Extracts the Google Drive Folder ID from its URL, ignoring query parameters."""
+    try:
+        parsed_url = urlparse(url)
+        path = parsed_url.path
+        if '/folders/' in path:
+            return path.split('/folders/')[1].split('/')[0]
+        elif len(url) > 20 and ' ' not in url and not url.startswith('http'):
+             return url
+        else:
+            raise ValueError("URL does not contain '/folders/'.")
+    except (IndexError, ValueError) as e:
+        raise ValueError(f"Invalid Google Drive Folder URL: '{url}'. Could not extract Folder ID. {e}")
+
 
 def get_sheet_data(sheets_service, spreadsheet_id: str, data_range: str) -> tuple[list, list]:
     """Fetches data from a Google Sheet, separating the header from data rows."""
@@ -95,12 +126,19 @@ def update_sheet_cell(sheets_service, spreadsheet_id: str, sheet_name: str, row_
         print(f"❌ Error updating cell {range_name}: {error}")
         return False
 
+# --- MODIFIED: Added supportsAllDrives=True for Shared Drive compatibility ---
 def upload_file_to_drive(drive_service, file_path: str, folder_id: str, file_name: str) -> str | None:
     """Uploads a file to a specified Google Drive folder."""
     file_metadata = {'name': file_name, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype='image/png')
     try:
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        # This parameter is required for service accounts to upload to Shared Drives.
+        file = drive_service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            fields='id',
+            supportsAllDrives=True 
+        ).execute()
         print(f"✅ Uploaded '{file_name}' to Drive. File ID: {file.get('id')}")
         return file.get('id')
     except HttpError as error:
@@ -124,24 +162,26 @@ def generate_qr_code(data: str, file_path: str, size: int) -> bool:
 def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
     """Creates a personalized ticket by overlaying a name and QR code onto a template."""
     try:
-        base_img = Image.open(config.TICKET_TEMPLATE_EMPTY_PATH).convert("RGBA")
+        local_template_path = download_file(config.TICKET_TEMPLATE_EMPTY_PATH, "temp/template.png")
+        local_font_path = download_file(config.FONT_PATH, "temp/font.ttf")
+        if not local_template_path or not local_font_path:
+            return False
+
+        base_img = Image.open(local_template_path).convert("RGBA")
         draw = ImageDraw.Draw(base_img)
 
-        # Load font
         try:
-            font = ImageFont.truetype(config.FONT_PATH, config.DETECTED_FONT_SIZE)
+            font = ImageFont.truetype(local_font_path, config.DETECTED_FONT_SIZE)
         except IOError:
-            print(f"⚠️ Warning: Font '{config.FONT_PATH}' not found. Using default font.")
+            print(f"⚠️ Warning: Font from URL '{config.FONT_PATH}' could not be loaded. Using default font.")
             font = ImageFont.load_default()
 
-        # Position and draw name (centered horizontally)
         text_bbox = draw.textbbox((0, 0), name, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         text_x = (base_img.width - text_width) / 2
         text_y = config.DETECTED_NAME_TEXT_Y_POS
         draw.text((text_x, text_y), name, font=font, fill=config.TEXT_COLOR)
 
-        # Position and paste QR code (centered horizontally)
         qr_img = Image.open(qr_code_path).convert("RGBA")
         qr_x = (base_img.width - qr_img.width) / 2
         base_img.paste(qr_img, (int(qr_x), int(config.DETECTED_QR_CODE_Y_POS)), qr_img)
@@ -156,7 +196,11 @@ def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
 def send_ticket_email(recipient_email: str, recipient_name: str, ticket_file_path: str) -> bool:
     """Sends an email with the generated ticket attached."""
     try:
-        with open(config.EMAIL_MESSAGE_PATH, 'r', encoding='utf-8') as f:
+        local_email_path = download_file(config.EMAIL_MESSAGE_PATH, "temp/email_message.txt")
+        if not local_email_path:
+            return False
+            
+        with open(local_email_path, 'r', encoding='utf-8') as f:
             message_template = f.read()
 
         email_body = message_template.replace('{name}', recipient_name)
@@ -191,28 +235,43 @@ def main():
     """Main function to run the ticketing automation loop."""
     print("--- 🚀 Event Ticketing Automation System ---")
 
-    # On startup, reload config in case it was modified by OCR
     importlib.reload(config)
 
+    def build_google_service(service_name, version):
+        """Builds a Google service client using the service account from config."""
+        if not config.GOOGLE_SA_JSON:
+            print(f"⚠️ {service_name.capitalize()} service not configured. Check GOOGLE_SERVICE_ACCOUNT_JSON in .env")
+            return None
+        try:
+            cred_dict = json.loads(config.GOOGLE_SA_JSON)
+            scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+            creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
+            service = build(service_name, version, credentials=creds)
+            print(f"✅ Google {service_name.capitalize()} service initialized.")
+            return service
+        except Exception as e:
+            print(f"❌ Error initializing {service_name.capitalize()} service: {e}")
+            return None
+
     print("\n--- Initializing Google API services ---")
-    sheets_service = authenticate_google_api('sheets', 'v4', APPLICATION_SCOPES)
-    drive_service = authenticate_google_api('drive', 'v3', APPLICATION_SCOPES)
+    sheets_service = build_google_service('sheets', 'v4')
+    drive_service = build_google_service('drive', 'v3')
 
     if not sheets_service or not drive_service:
-        print("❌ CRITICAL: Could not authenticate with Google APIs. Check credentials.json.")
+        print("❌ CRITICAL: Could not authenticate with Google APIs. Check your service account credentials.")
         exit(1)
-    print("✅ Google API services initialized successfully.")
 
     try:
         spreadsheet_id = get_spreadsheet_id_from_url(config.MAIN_SHEET_LINK)
+        tickets_folder_id = get_folder_id_from_url(config.TICKETS_FOLDER_ID)
+        qr_codes_folder_id = get_folder_id_from_url(config.QR_CODES_FOLDER_ID)
     except ValueError as e:
-        print(f"❌ CRITICAL: {e}. Correct MAIN_SHEET_LINK in config.py.")
+        print(f"❌ CRITICAL: {e}. Check your links in the .env file.")
         exit(1)
 
     print(f"\n--- 🔄 Starting continuous monitoring of '{config.MAIN_SHEET_NAME}' ---")
     print(f"Polling every {config.POLLING_INTERVAL_SECONDS} seconds. Press Ctrl+C to stop.")
 
-    # Main Polling Loop
     while True:
         try:
             print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Checking for new data...")
@@ -240,27 +299,25 @@ def main():
                 time.sleep(config.POLLING_INTERVAL_SECONDS)
                 continue
 
-            # Process each row
             for i, row in enumerate(sheet_data):
                 name = get_value_safe(row, COLUMN_INDICES[config.COL_NAME]).strip()
                 email = get_value_safe(row, COLUMN_INDICES[config.COL_EMAIL]).strip()
                 ticket_status = get_value_safe(row, COLUMN_INDICES[config.COL_TICKET_STATUS]).strip()
 
                 if not name or not email:
-                    continue # Skip empty or malformed rows
+                    continue
 
                 row_unique_id = f"{name}-{email}"
 
                 if ticket_status == "Sent" or row_unique_id in PROCESSED_ENTRIES:
-                    continue # Skip already processed entries
+                    continue
 
                 print(f"\n✨ Processing new entry: Name='{name}', Email='{email}'")
                 PROCESSED_ENTRIES.add(row_unique_id)
-                os.makedirs("temp", exist_ok=True) # Ensure temp folder exists
+                os.makedirs("temp", exist_ok=True)
 
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Generating...")
 
-                # --- MODIFIED: Transactional logic to update sheet before database ---
                 attendee_id = None
                 existing_attendee = mongo_client.find_attendee_by_email_and_name(email, name)
 
@@ -275,19 +332,15 @@ def main():
                     print(f"➕ No existing attendee found for {email} and {name}. Creating new entry.")
                     attendee_id = str(uuid.uuid4())
                     
-                    # Step 1: Attempt to write the new ID to the sheet first.
                     id_update_success = update_sheet_cell(
                         sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, 
                         i, COLUMN_INDICES["Attendee ID"], attendee_id
                     )
 
-                    # Step 2: Only if the sheet update was successful, insert into the database.
                     if id_update_success:
                         try:
                             full_attendee_data = {header: get_value_safe(row, idx) for idx, header in enumerate(headers)}
                             full_attendee_data['attendee_id'] = attendee_id
-                            
-                            # --- FIX: Explicitly set initial statuses for the database entry ---
                             full_attendee_data[config.COL_TICKET_STATUS] = 'Issued'
                             full_attendee_data[config.COL_EMAIL_STATUS] = 'Pending'
                             
@@ -298,7 +351,6 @@ def main():
                             update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (DB)")
                             continue
                     else:
-                        # If the sheet update failed, abort this record.
                         print(f"❌ Aborting processing for '{name}' due to sheet update failure.")
                         update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (Sheet)")
                         continue
@@ -315,16 +367,23 @@ def main():
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (Image)")
                     continue
 
-                upload_file_to_drive(drive_service, qr_path, config.QR_CODES_FOLDER_ID, qr_filename)
-                upload_file_to_drive(drive_service, ticket_path, config.TICKETS_FOLDER_ID, ticket_filename)
+                upload_file_to_drive(drive_service, qr_path, qr_codes_folder_id, qr_filename)
+                upload_file_to_drive(drive_service, ticket_path, tickets_folder_id, ticket_filename)
+                
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Generated")
+                mongo_client.update_attendee_field(attendee_id, config.COL_TICKET_STATUS, "Generated")
+                
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Sending...")
+                mongo_client.update_attendee_field(attendee_id, config.COL_EMAIL_STATUS, "Sending...")
 
                 if send_ticket_email(email, name, ticket_path):
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Sent")
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Sent")
+                    mongo_client.update_attendee_field(attendee_id, config.COL_TICKET_STATUS, "Sent")
+                    mongo_client.update_attendee_field(attendee_id, config.COL_EMAIL_STATUS, "Sent")
                 else:
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Failed (Email)")
+                    mongo_client.update_attendee_field(attendee_id, config.COL_EMAIL_STATUS, "Failed (Email)")
 
                 os.remove(qr_path)
                 os.remove(ticket_path)

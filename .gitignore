@@ -1,12 +1,3 @@
-# Ignore Google API token file
-token.json
-
-# Ignore Google API client secret file
-credentials.json
-
-# Ignore Config file for persinal info
-config.py
-
 # Ignore virtual environment folder
 venv/
 
@@ -23,3 +14,7 @@ temp/
 __pycache__/
 *.pyc
 *.ipynb_checkpoints/
+
+# Ignore .env file
+.env
+.env.*
