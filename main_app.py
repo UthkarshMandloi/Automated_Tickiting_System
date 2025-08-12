@@ -4,7 +4,19 @@
 # This script is now configured to run on a server using Google Service Account
 # credentials for authentication, removing the need for browser-based login.
 # It can download assets like templates and fonts directly from URLs.
-# It also runs a simple web server for status checks.
+# It also runs a simple web server for status checks and data retrieval.
+#
+# To check the status from your terminal while the script is running,
+# you can use one of the following commands (assuming the default port 8000):
+#
+# On macOS/Linux (or Windows with Git Bash/WSL):
+# curl http://localhost:8000                 # Basic status
+# curl http://localhost:8000/attendees        # List all registered attendees
+# curl http://localhost:8000/unsent           # List attendees with unsent emails
+# curl http://localhost:8000/errors           # List recent errors
+#
+# On Windows (using PowerShell):
+# Invoke-WebRequest -Uri http://localhost:8000
 # -----------------------------------------------------------------------------
 
 # =============================================================================
@@ -57,20 +69,91 @@ except ImportError:
 # --- Global Application State & Constants ---
 PROCESSED_ENTRIES = set()
 COLUMN_INDICES = {}
+ERROR_LOG = []
+MAX_ERROR_LOG_SIZE = 100
 mongo_client = MongoDBClient() # Initialize MongoDB client
+
+def log_error(message):
+    """Logs an error message to the console and a global list."""
+    print(message)
+    if len(ERROR_LOG) >= MAX_ERROR_LOG_SIZE:
+        ERROR_LOG.pop(0) # Remove the oldest error
+    ERROR_LOG.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 
 ###
 # --- Web Server Components ---
 ###
 
 class StatusHandler(http.server.SimpleHTTPRequestHandler):
-    """A simple handler to respond that the service is running."""
+    """A handler for multiple API endpoints for status and data retrieval."""
     def do_GET(self):
+        if self.path == '/':
+            self.send_status_response()
+        elif self.path == '/errors':
+            self.send_json_response(ERROR_LOG)
+        elif self.path == '/attendees':
+            self.send_attendees_response()
+        elif self.path == '/unsent':
+            self.send_unsent_response()
+        else:
+            self.send_error(404, "Not Found")
+
+    def send_json_response(self, data):
+        """Sends a JSON response."""
+        self.send_response(200)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2).encode('utf-8'))
+
+    def send_status_response(self):
+        """Sends a simple text status response."""
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
         status_message = f"✅ Event Ticketing System is running.\nLast check: {time.strftime('%Y-%m-%d %H:%M:%S')}"
         self.wfile.write(status_message.encode('utf-8'))
+
+    def send_attendees_response(self):
+        """Fetches and returns all attendees from MongoDB."""
+        try:
+            attendees = mongo_client.get_all_attendees()
+            # Sanitize the data for JSON serialization
+            sanitized_attendees = []
+            for attendee in attendees:
+                attendee['_id'] = str(attendee['_id']) # Convert ObjectId to string
+                sanitized_attendees.append({
+                    "name": attendee.get(config.COL_NAME),
+                    "email": attendee.get(config.COL_EMAIL),
+                    "attendee_id": attendee.get("attendee_id"),
+                    "ticket_status": attendee.get(config.COL_TICKET_STATUS),
+                    "email_status": attendee.get(config.COL_EMAIL_STATUS)
+                })
+            self.send_json_response(sanitized_attendees)
+        except Exception as e:
+            self.send_error(500, f"Error fetching attendees: {e}")
+            log_error(f"API Error fetching attendees: {e}")
+
+    def send_unsent_response(self):
+        """Fetches and returns attendees with unsent emails."""
+        try:
+            # Find attendees where email status is not 'Sent'
+            unsent = mongo_client.find_attendees_by_query(
+                {config.COL_EMAIL_STATUS: {"$ne": "Sent"}}
+            )
+            sanitized_unsent = []
+            for attendee in unsent:
+                attendee['_id'] = str(attendee['_id'])
+                sanitized_unsent.append({
+                    "name": attendee.get(config.COL_NAME),
+                    "email": attendee.get(config.COL_EMAIL),
+                    "attendee_id": attendee.get("attendee_id"),
+                    "email_status": attendee.get(config.COL_EMAIL_STATUS)
+                })
+            self.send_json_response(sanitized_unsent)
+        except Exception as e:
+            self.send_error(500, f"Error fetching unsent list: {e}")
+            log_error(f"API Error fetching unsent list: {e}")
+
 
 def run_web_server(port=8000):
     """Runs a simple HTTP server in a separate thread."""
@@ -99,7 +182,7 @@ def download_file(url, local_filename):
         print(f"✅ Successfully downloaded '{local_filename}' from URL.")
         return local_filename
     except Exception as e:
-        print(f"❌ Error downloading file from {url}: {e}")
+        log_error(f"❌ Error downloading file from {url}: {e}")
         return None
 
 
@@ -134,7 +217,7 @@ def get_sheet_data(sheets_service, spreadsheet_id: str, data_range: str) -> tupl
             return [], []
         return values[0], values[1:] # headers, data
     except HttpError as error:
-        print(f"❌ An error occurred while fetching sheet data: {error}")
+        log_error(f"❌ An error occurred while fetching sheet data: {error}")
         return [], []
 
 def update_sheet_cell(sheets_service, spreadsheet_id: str, sheet_name: str, row_index: int, col_index: int, value: str) -> bool:
@@ -146,7 +229,7 @@ def update_sheet_cell(sheets_service, spreadsheet_id: str, sheet_name: str, row_
         print(f"✅ Sheet updated: Cell '{range_name}' set to '{value}'")
         return True
     except HttpError as error:
-        print(f"❌ Error updating cell {range_name}: {error}")
+        log_error(f"❌ Error updating cell {range_name}: {error}")
         return False
 
 # --- MODIFIED: Added supportsAllDrives=True for Shared Drive compatibility ---
@@ -165,7 +248,7 @@ def upload_file_to_drive(drive_service, file_path: str, folder_id: str, file_nam
         print(f"✅ Uploaded '{file_name}' to Drive. File ID: {file.get('id')}")
         return file.get('id')
     except HttpError as error:
-        print(f"❌ Error uploading '{file_name}' to Drive: {error}")
+        log_error(f"❌ Error uploading '{file_name}' to Drive: {error}")
         return None
 
 def generate_qr_code(data: str, file_path: str, size: int) -> bool:
@@ -179,7 +262,7 @@ def generate_qr_code(data: str, file_path: str, size: int) -> bool:
         print(f"✅ QR code generated: {file_path}")
         return True
     except Exception as e:
-        print(f"❌ Error generating QR code: {e}")
+        log_error(f"❌ Error generating QR code: {e}")
         return False
 
 def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
@@ -213,7 +296,7 @@ def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
         print(f"✅ Personalized ticket created: {output_path}")
         return True
     except Exception as e:
-        print(f"❌ Error creating ticket image: {e}")
+        log_error(f"❌ Error creating ticket image: {e}")
         return False
 
 def send_ticket_email(recipient_email: str, recipient_name: str, ticket_file_path: str) -> bool:
@@ -244,7 +327,7 @@ def send_ticket_email(recipient_email: str, recipient_name: str, ticket_file_pat
         print(f"✅ Email with ticket successfully sent to {recipient_email}.")
         return True
     except Exception as e:
-        print(f"❌ Error sending email to {recipient_email}: {e}")
+        log_error(f"❌ Error sending email to {recipient_email}: {e}")
         return False
 
 def get_value_safe(row: list, col_idx: int) -> str:
@@ -263,7 +346,7 @@ def main():
     def build_google_service(service_name, version):
         """Builds a Google service client using the service account from config."""
         if not config.GOOGLE_SA_JSON:
-            print(f"⚠️ {service_name.capitalize()} service not configured. Check GOOGLE_SERVICE_ACCOUNT_JSON in .env")
+            log_error(f"⚠️ {service_name.capitalize()} service not configured. Check GOOGLE_SERVICE_ACCOUNT_JSON in .env")
             return None
         try:
             cred_dict = json.loads(config.GOOGLE_SA_JSON)
@@ -273,7 +356,7 @@ def main():
             print(f"✅ Google {service_name.capitalize()} service initialized.")
             return service
         except Exception as e:
-            print(f"❌ Error initializing {service_name.capitalize()} service: {e}")
+            log_error(f"❌ Error initializing {service_name.capitalize()} service: {e}")
             return None
 
     print("\n--- Initializing Google API services ---")
@@ -281,7 +364,7 @@ def main():
     drive_service = build_google_service('drive', 'v3')
 
     if not sheets_service or not drive_service:
-        print("❌ CRITICAL: Could not authenticate with Google APIs. Check your service account credentials.")
+        log_error("❌ CRITICAL: Could not authenticate with Google APIs. Check your service account credentials.")
         exit(1)
 
     try:
@@ -289,7 +372,7 @@ def main():
         tickets_folder_id = get_folder_id_from_url(config.TICKETS_FOLDER_ID)
         qr_codes_folder_id = get_folder_id_from_url(config.QR_CODES_FOLDER_ID)
     except ValueError as e:
-        print(f"❌ CRITICAL: {e}. Check your links in the .env file.")
+        log_error(f"❌ CRITICAL: {e}. Check your links in the .env file.")
         exit(1)
 
     print(f"\n--- 🔄 Starting continuous monitoring of '{config.MAIN_SHEET_NAME}' ---")
@@ -313,7 +396,7 @@ def main():
             ]
             for col_name in required_columns:
                 if col_name not in headers:
-                    print(f"❌ CRITICAL: Column '{col_name}' not found in sheet. Exiting.")
+                    log_error(f"❌ CRITICAL: Column '{col_name}' not found in sheet. Exiting.")
                     exit(1)
                 COLUMN_INDICES[col_name] = headers.index(col_name)
 
@@ -370,11 +453,11 @@ def main():
                             mongo_client.insert_full_attendee(full_attendee_data)
                             print(f"✅ New attendee '{name}' inserted into MongoDB with ID: {attendee_id}")
                         except Exception as e:
-                            print(f"❌ Error inserting new attendee '{name}' into MongoDB: {e}")
+                            log_error(f"❌ Error inserting new attendee '{name}' into MongoDB: {e}")
                             update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (DB)")
                             continue
                     else:
-                        print(f"❌ Aborting processing for '{name}' due to sheet update failure.")
+                        log_error(f"❌ Aborting processing for '{name}' due to sheet update failure.")
                         update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (Sheet)")
                         continue
 
@@ -418,7 +501,7 @@ def main():
             print("\n🛑 Monitoring stopped by user. Exiting gracefully.")
             break
         except Exception as e:
-            print(f"\n❌ An unexpected error occurred in the main loop: {e}")
+            log_error(f"\n❌ An unexpected error occurred in the main loop: {e}")
             print("Restarting monitoring after a short delay...")
             time.sleep(config.POLLING_INTERVAL_SECONDS * 2)
 
@@ -478,9 +561,9 @@ def test_single_ticket_generation():
         print(f"✅✅✅ Test successful! Image generated and saved as '{output_path}'.")
 
     except FileNotFoundError as e:
-        print(f"❌ TEST FAILED: File not found - {e}. Make sure the required files are in the directory.")
+        log_error(f"❌ TEST FAILED: File not found - {e}. Make sure the required files are in the directory.")
     except Exception as e:
-        print(f"❌ TEST FAILED: An unexpected error occurred: {e}")
+        log_error(f"❌ TEST FAILED: An unexpected error occurred: {e}")
 
 
 # =============================================================================
