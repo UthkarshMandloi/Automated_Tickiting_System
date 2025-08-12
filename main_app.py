@@ -4,6 +4,7 @@
 # This script is now configured to run on a server using Google Service Account
 # credentials for authentication, removing the need for browser-based login.
 # It can download assets like templates and fonts directly from URLs.
+# It also runs a simple web server for status checks.
 # -----------------------------------------------------------------------------
 
 # =============================================================================
@@ -17,6 +18,9 @@ import smtplib
 import importlib
 import json
 import requests
+import threading
+import http.server
+import socketserver
 from urllib.parse import quote_plus, urlparse
 from PIL import Image, ImageDraw, ImageFont
 
@@ -54,6 +58,25 @@ except ImportError:
 PROCESSED_ENTRIES = set()
 COLUMN_INDICES = {}
 mongo_client = MongoDBClient() # Initialize MongoDB client
+
+###
+# --- Web Server Components ---
+###
+
+class StatusHandler(http.server.SimpleHTTPRequestHandler):
+    """A simple handler to respond that the service is running."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        status_message = f"✅ Event Ticketing System is running.\nLast check: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        self.wfile.write(status_message.encode('utf-8'))
+
+def run_web_server(port=8000):
+    """Runs a simple HTTP server in a separate thread."""
+    with socketserver.TCPServer(("", port), StatusHandler) as httpd:
+        print(f"🌐 Simple web server started at http://localhost:{port}")
+        httpd.serve_forever()
 
 ###
 # --- Utility Functions ---
@@ -134,10 +157,10 @@ def upload_file_to_drive(drive_service, file_path: str, folder_id: str, file_nam
     try:
         # This parameter is required for service accounts to upload to Shared Drives.
         file = drive_service.files().create(
-            body=file_metadata, 
-            media_body=media, 
+            body=file_metadata,
+            media_body=media,
             fields='id',
-            supportsAllDrives=True 
+            supportsAllDrives=True
         ).execute()
         print(f"✅ Uploaded '{file_name}' to Drive. File ID: {file.get('id')}")
         return file.get('id')
@@ -199,7 +222,7 @@ def send_ticket_email(recipient_email: str, recipient_name: str, ticket_file_pat
         local_email_path = download_file(config.EMAIL_MESSAGE_PATH, "temp/email_message.txt")
         if not local_email_path:
             return False
-            
+
         with open(local_email_path, 'r', encoding='utf-8') as f:
             message_template = f.read()
 
@@ -282,11 +305,11 @@ def main():
                 continue
 
             required_columns = [
-                config.COL_NAME, 
-                config.COL_EMAIL, 
-                config.COL_TICKET_STATUS, 
+                config.COL_NAME,
+                config.COL_EMAIL,
+                config.COL_TICKET_STATUS,
                 config.COL_EMAIL_STATUS,
-                "Attendee ID" 
+                "Attendee ID"
             ]
             for col_name in required_columns:
                 if col_name not in headers:
@@ -331,9 +354,9 @@ def main():
                 else:
                     print(f"➕ No existing attendee found for {email} and {name}. Creating new entry.")
                     attendee_id = str(uuid.uuid4())
-                    
+
                     id_update_success = update_sheet_cell(
-                        sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, 
+                        sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME,
                         i, COLUMN_INDICES["Attendee ID"], attendee_id
                     )
 
@@ -343,7 +366,7 @@ def main():
                             full_attendee_data['attendee_id'] = attendee_id
                             full_attendee_data[config.COL_TICKET_STATUS] = 'Issued'
                             full_attendee_data[config.COL_EMAIL_STATUS] = 'Pending'
-                            
+
                             mongo_client.insert_full_attendee(full_attendee_data)
                             print(f"✅ New attendee '{name}' inserted into MongoDB with ID: {attendee_id}")
                         except Exception as e:
@@ -354,7 +377,7 @@ def main():
                         print(f"❌ Aborting processing for '{name}' due to sheet update failure.")
                         update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (Sheet)")
                         continue
-                
+
                 qr_filename = f"{name.replace(' ', '_')}_QR.png"
                 qr_path = os.path.join("temp", qr_filename)
                 if not generate_qr_code(attendee_id, qr_path, config.DETECTED_QR_CODE_TARGET_SIZE):
@@ -369,10 +392,10 @@ def main():
 
                 upload_file_to_drive(drive_service, qr_path, qr_codes_folder_id, qr_filename)
                 upload_file_to_drive(drive_service, ticket_path, tickets_folder_id, ticket_filename)
-                
+
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Generated")
                 mongo_client.update_attendee_field(attendee_id, config.COL_TICKET_STATUS, "Generated")
-                
+
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Sending...")
                 mongo_client.update_attendee_field(attendee_id, config.COL_EMAIL_STATUS, "Sending...")
 
@@ -417,12 +440,12 @@ def test_single_ticket_generation():
         qr_code_path = "qr.png" # Make sure you have a dummy qr.png for this test
         font_path = "Poppins-Bold.ttf" # Make sure you have this font file
         output_path = "test_final_output.png"
-        
+
         name = "Uthkarsh Mandloi"
         font_size = 60
         # Manually set positions for the test. Adjust these to match your template.
-        text_position_y = 750 
-        qr_position_y = 950 
+        text_position_y = 750
+        qr_position_y = 950
         qr_size = 350
 
         # --- Test Logic ---
@@ -441,12 +464,12 @@ def test_single_ticket_generation():
 
         print("Drawing text on image...")
         font = ImageFont.truetype(font_path, font_size)
-        
+
         # Center text horizontally
         text_bbox = draw.textbbox((0, 0), name, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         text_pos_x = (base_img.width - text_width) / 2
-        
+
         draw.text((text_pos_x, text_position_y), name, font=font, fill=(0, 0, 0, 255)) # Black text
 
         print(f"Saving final image to: {output_path}")
@@ -466,7 +489,12 @@ def test_single_ticket_generation():
 
 if __name__ == '__main__':
     # --- CHOOSE WHICH FUNCTION TO RUN ---
-    
+
+    # Start the simple web server in a background thread
+    # This is useful for health checks in containerized environments
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
+
     # To run the main application that polls the Google Sheet, call main()
     main()
 
