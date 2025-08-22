@@ -10,10 +10,10 @@
 # you can use one of the following commands (assuming the default port 8000):
 #
 # On macOS/Linux (or Windows with Git Bash/WSL):
-# curl http://localhost:8000                 # Basic status
-# curl http://localhost:8000/attendees        # List all registered attendees
-# curl http://localhost:8000/unsent           # List attendees with unsent emails
-# curl http://localhost:8000/errors           # List recent errors
+# curl http://localhost:8000               # Basic status
+# curl http://localhost:8000/attendees       # List all registered attendees
+# curl http://localhost:8000/unsent          # List attendees with unsent emails
+# curl http://localhost:8000/errors          # List recent errors
 #
 # On Windows (using PowerShell):
 # Invoke-WebRequest -Uri http://localhost:8000
@@ -268,6 +268,14 @@ def generate_qr_code(data: str, file_path: str, size: int) -> bool:
 def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
     """Creates a personalized ticket by overlaying a name and QR code onto a template."""
     try:
+        # --- MANUAL POSITIONING SETTINGS ---
+        # Adjust these X and Y coordinates to position the elements on your template.
+        # The coordinates (0,0) represent the top-left corner of the image.
+        # If X is set to 'center', the element will be horizontally centered.
+        NAME_POSITION = (1081, 512)  # (X, Y) or ('center', Y)
+        QR_CODE_POSITION = (335, 319) # (X, Y) or ('center', Y)
+        # --- END MANUAL SETTINGS ---
+
         local_template_path = download_file(config.TICKET_TEMPLATE_EMPTY_PATH, "temp/template.png")
         local_font_path = download_file(config.FONT_PATH, "temp/font.ttf")
         if not local_template_path or not local_font_path:
@@ -275,22 +283,47 @@ def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
 
         base_img = Image.open(local_template_path).convert("RGBA")
         draw = ImageDraw.Draw(base_img)
+        
+        # --- DEBUGGING: Print template dimensions ---
+        print(f"ℹ️  Template dimensions (Width x Height): {base_img.width} x {base_img.height}")
+        print(f"ℹ️  Attempting to place Name at Y={NAME_POSITION[1]} and QR Code at Y={QR_CODE_POSITION[1]}")
+
 
         try:
-            font = ImageFont.truetype(local_font_path, config.DETECTED_FONT_SIZE)
+            # Use a default font size if not specified in config, to avoid errors
+            font_size = getattr(config, 'DETECTED_FONT_SIZE', 60)
+            if font_size <= 0:
+                print("⚠️ Warning: Font size is 0 or less. Defaulting to 60.")
+                font_size = 60
+            font = ImageFont.truetype(local_font_path, font_size)
         except IOError:
             print(f"⚠️ Warning: Font from URL '{config.FONT_PATH}' could not be loaded. Using default font.")
             font = ImageFont.load_default()
 
+        # --- Position and draw the name ---
         text_bbox = draw.textbbox((0, 0), name, font=font)
         text_width = text_bbox[2] - text_bbox[0]
-        text_x = (base_img.width - text_width) / 2
-        text_y = config.DETECTED_NAME_TEXT_Y_POS
-        draw.text((text_x, text_y), name, font=font, fill=config.TEXT_COLOR)
+        
+        text_x = NAME_POSITION[0]
+        if text_x == 'center':
+            text_x = (base_img.width - text_width) / 2
+        
+        text_y = NAME_POSITION[1]
+        
+        # --- DEBUGGING: Use a bright red color to ensure visibility ---
+        text_color = (255, 0, 0, 255) # RGBA Red. Was config.TEXT_COLOR
+        draw.text((text_x, text_y), name, font=font, fill=text_color)
 
+        # --- Position and paste the QR code ---
         qr_img = Image.open(qr_code_path).convert("RGBA")
-        qr_x = (base_img.width - qr_img.width) / 2
-        base_img.paste(qr_img, (int(qr_x), int(config.DETECTED_QR_CODE_Y_POS)), qr_img)
+        
+        qr_x = QR_CODE_POSITION[0]
+        if qr_x == 'center':
+            qr_x = (base_img.width - qr_img.width) / 2
+            
+        qr_y = QR_CODE_POSITION[1]
+        
+        base_img.paste(qr_img, (int(qr_x), int(qr_y)), qr_img)
 
         base_img.save(output_path)
         print(f"✅ Personalized ticket created: {output_path}")
@@ -314,7 +347,7 @@ def send_ticket_email(recipient_email: str, recipient_name: str, ticket_file_pat
         msg['From'] = config.SENDER_EMAIL
         msg['To'] = recipient_email
         msg['Subject'] = "Your Event E-Ticket is Here!"
-        msg.attach(MIMEText(email_body, 'plain'))
+        msg.attach(MIMEText(email_body, 'html'))
 
         with open(ticket_file_path, 'rb') as fp:
             img = MIMEImage(fp.read(), _subtype="png")
