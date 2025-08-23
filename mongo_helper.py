@@ -9,6 +9,10 @@ class MongoDBClient:
     def __init__(self):
         """Initializes the connection to the MongoDB database and collection."""
         try:
+            if not MONGO_DB_NAME:
+                raise ValueError("MONGO_DB_NAME is not set.")
+            if not MONGO_COLLECTION_NAME:
+                raise ValueError("MONGO_COLLECTION_NAME is not set.")
             self.client = MongoClient(MONGO_URI)
             self.db = self.client[MONGO_DB_NAME]
             self.collection = self.db[MONGO_COLLECTION_NAME]
@@ -53,3 +57,11 @@ class MongoDBClient:
     def get_attendee(self, attendee_id: str):
         """Retrieves a single attendee document by their unique attendee_id."""
         return self.collection.find_one({"attendee_id": attendee_id})
+    
+    def find_attendees_by_query(self, query: dict):
+        """
+        Finds attendees based on a flexible query.
+        To get all attendees, pass an empty dictionary: {}.
+        """
+        # The .find() method returns a cursor, so we convert it to a list
+        return list(self.collection.find(query))

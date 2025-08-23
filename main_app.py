@@ -116,7 +116,7 @@ class StatusHandler(http.server.SimpleHTTPRequestHandler):
     def send_attendees_response(self):
         """Fetches and returns all attendees from MongoDB."""
         try:
-            attendees = mongo_client.get_all_attendees()
+            attendees = mongo_client.find_attendees_by_query({})
             # Sanitize the data for JSON serialization
             sanitized_attendees = []
             for attendee in attendees:
