@@ -232,13 +232,11 @@ def update_sheet_cell(sheets_service, spreadsheet_id: str, sheet_name: str, row_
         log_error(f"❌ Error updating cell {range_name}: {error}")
         return False
 
-# --- MODIFIED: Added supportsAllDrives=True for Shared Drive compatibility ---
 def upload_file_to_drive(drive_service, file_path: str, folder_id: str, file_name: str) -> str | None:
     """Uploads a file to a specified Google Drive folder."""
     file_metadata = {'name': file_name, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, mimetype='image/png')
     try:
-        # This parameter is required for service accounts to upload to Shared Drives.
         file = drive_service.files().create(
             body=file_metadata,
             media_body=media,
@@ -251,15 +249,22 @@ def upload_file_to_drive(drive_service, file_path: str, folder_id: str, file_nam
         log_error(f"❌ Error uploading '{file_name}' to Drive: {error}")
         return None
 
-def generate_qr_code(data: str, file_path: str, size: int) -> bool:
-    """Generates and saves a QR code image."""
+def generate_qr_code(data: str, file_path: str, size: int, corner_radius: int) -> bool:
+    """Generates and saves a QR code image with rounded corners."""
     try:
-        qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=10, border=4)
+        qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=10, border=2)
         qr.add_data(data)
         qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white").resize((size, size), Image.Resampling.LANCZOS)
+        img = qr.make_image(fill_color="black", back_color="white").convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+
+        mask = Image.new('L', (size, size), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle((0, 0, size, size), radius=corner_radius, fill=255)
+
+        img.putalpha(mask)
+        
         img.save(file_path)
-        print(f"✅ QR code generated: {file_path}")
+        print(f"✅ QR code with rounded corners generated: {file_path}")
         return True
     except Exception as e:
         log_error(f"❌ Error generating QR code: {e}")
@@ -268,39 +273,36 @@ def generate_qr_code(data: str, file_path: str, size: int) -> bool:
 def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
     """Creates a personalized ticket by overlaying a name and QR code onto a template."""
     try:
-        # --- MANUAL POSITIONING SETTINGS ---
-        # Adjust these X and Y coordinates to position the elements on your template.
-        # The coordinates (0,0) represent the top-left corner of the image.
-        # If X is set to 'center', the element will be horizontally centered.
-        NAME_POSITION = (1081, 512)  # (X, Y) or ('center', Y)
-        QR_CODE_POSITION = (335, 319) # (X, Y) or ('center', Y)
-        # --- END MANUAL SETTINGS ---
+        # --- TYPOGRAPHY & STYLE SETTINGS ---
+        FONT_URL = "https://drive.google.com/file/d/1nbAEoAi7vaGJf4nkx6gjaxwKplzKWFhd/view?usp=sharing"
+        TEXT_COLOR = (17, 17, 17) 
+        # --- ADJUSTED: Reduced font size to prevent wrapping ---
+        FONT_SIZE = 30
+        
+        # --- MANUAL POSITIONING (Adjust as needed) ---
+        # --- ADJUSTED: Centered the name and QR code horizontally ---
+        NAME_POSITION = (51, 887)
+        QR_CODE_POSITION = (184, 394)
 
+
+        # --- Download assets ---
         local_template_path = download_file(config.TICKET_TEMPLATE_EMPTY_PATH, "temp/template.png")
-        local_font_path = download_file(config.FONT_PATH, "temp/font.ttf")
+        local_font_path = download_file(FONT_URL, "temp/Inter-Bold.ttf")
+        
         if not local_template_path or not local_font_path:
+            log_error("Critical error: Font or template download failed. Cannot create ticket.")
             return False
 
         base_img = Image.open(local_template_path).convert("RGBA")
         draw = ImageDraw.Draw(base_img)
-        
-        # --- DEBUGGING: Print template dimensions ---
-        print(f"ℹ️  Template dimensions (Width x Height): {base_img.width} x {base_img.height}")
-        print(f"ℹ️  Attempting to place Name at Y={NAME_POSITION[1]} and QR Code at Y={QR_CODE_POSITION[1]}")
-
 
         try:
-            # Use a default font size if not specified in config, to avoid errors
-            font_size = getattr(config, 'DETECTED_FONT_SIZE', 60)
-            if font_size <= 0:
-                print("⚠️ Warning: Font size is 0 or less. Defaulting to 60.")
-                font_size = 60
-            font = ImageFont.truetype(local_font_path, font_size)
+            font = ImageFont.truetype(local_font_path, FONT_SIZE)
         except IOError:
-            print(f"⚠️ Warning: Font from URL '{config.FONT_PATH}' could not be loaded. Using default font.")
+            print(f"⚠️ Warning: Font from URL '{FONT_URL}' could not be loaded. Using default font.")
             font = ImageFont.load_default()
 
-        # --- Position and draw the name ---
+        # --- Position and draw the name with the new style ---
         text_bbox = draw.textbbox((0, 0), name, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         
@@ -309,10 +311,7 @@ def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
             text_x = (base_img.width - text_width) / 2
         
         text_y = NAME_POSITION[1]
-        
-        # --- DEBUGGING: Use a bright red color to ensure visibility ---
-        text_color = (255, 0, 0, 255) # RGBA Red. Was config.TEXT_COLOR
-        draw.text((text_x, text_y), name, font=font, fill=text_color)
+        draw.text((text_x, text_y), name, font=font, fill=TEXT_COLOR)
 
         # --- Position and paste the QR code ---
         qr_img = Image.open(qr_code_path).convert("RGBA")
@@ -335,7 +334,7 @@ def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
 def send_ticket_email(recipient_email: str, recipient_name: str, ticket_file_path: str) -> bool:
     """Sends an email with the generated ticket attached."""
     try:
-        local_email_path = download_file(config.EMAIL_MESSAGE_PATH, "temp/email_message.txt")
+        local_email_path = download_file(config.EMAIL_MESSAGE_PATH, "temp/email_message.html")
         if not local_email_path:
             return False
 
@@ -420,13 +419,7 @@ def main():
                 time.sleep(config.POLLING_INTERVAL_SECONDS)
                 continue
 
-            required_columns = [
-                config.COL_NAME,
-                config.COL_EMAIL,
-                config.COL_TICKET_STATUS,
-                config.COL_EMAIL_STATUS,
-                "Attendee ID"
-            ]
+            required_columns = [config.COL_NAME, config.COL_EMAIL, config.COL_TICKET_STATUS, config.COL_EMAIL_STATUS, "Attendee ID"]
             for col_name in required_columns:
                 if col_name not in headers:
                     log_error(f"❌ CRITICAL: Column '{col_name}' not found in sheet. Exiting.")
@@ -443,13 +436,9 @@ def main():
                 email = get_value_safe(row, COLUMN_INDICES[config.COL_EMAIL]).strip()
                 ticket_status = get_value_safe(row, COLUMN_INDICES[config.COL_TICKET_STATUS]).strip()
 
-                if not name or not email:
-                    continue
-
+                if not name or not email: continue
                 row_unique_id = f"{name}-{email}"
-
-                if ticket_status == "Sent" or row_unique_id in PROCESSED_ENTRIES:
-                    continue
+                if ticket_status == "Sent" or row_unique_id in PROCESSED_ENTRIES: continue
 
                 print(f"\n✨ Processing new entry: Name='{name}', Email='{email}'")
                 PROCESSED_ENTRIES.add(row_unique_id)
@@ -470,19 +459,13 @@ def main():
                 else:
                     print(f"➕ No existing attendee found for {email} and {name}. Creating new entry.")
                     attendee_id = str(uuid.uuid4())
-
-                    id_update_success = update_sheet_cell(
-                        sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME,
-                        i, COLUMN_INDICES["Attendee ID"], attendee_id
-                    )
-
+                    id_update_success = update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES["Attendee ID"], attendee_id)
                     if id_update_success:
                         try:
                             full_attendee_data = {header: get_value_safe(row, idx) for idx, header in enumerate(headers)}
                             full_attendee_data['attendee_id'] = attendee_id
                             full_attendee_data[config.COL_TICKET_STATUS] = 'Issued'
                             full_attendee_data[config.COL_EMAIL_STATUS] = 'Pending'
-
                             mongo_client.insert_full_attendee(full_attendee_data)
                             print(f"✅ New attendee '{name}' inserted into MongoDB with ID: {attendee_id}")
                         except Exception as e:
@@ -496,7 +479,10 @@ def main():
 
                 qr_filename = f"{name.replace(' ', '_')}_QR.png"
                 qr_path = os.path.join("temp", qr_filename)
-                if not generate_qr_code(attendee_id, qr_path, config.DETECTED_QR_CODE_TARGET_SIZE):
+                
+                # --- ADJUSTED: Reduced QR code size to 300px. You can also set this in your config.py ---
+                qr_code_size = 329
+                if not generate_qr_code(attendee_id, qr_path, qr_code_size, 30):
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (QR)")
                     continue
 
@@ -511,7 +497,6 @@ def main():
 
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Generated")
                 mongo_client.update_attendee_field(attendee_id, config.COL_TICKET_STATUS, "Generated")
-
                 update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_EMAIL_STATUS], "Sending...")
                 mongo_client.update_attendee_field(attendee_id, config.COL_EMAIL_STATUS, "Sending...")
 
@@ -545,56 +530,31 @@ def main():
 def test_single_ticket_generation():
     """
     A standalone function to test only the image generation logic.
-    It uses local files and does not require any API connections.
     This is useful for quickly verifying the template, font, and positioning.
     """
     print("\n--- 🧪 Running Standalone Image Generation Test ---")
-
+    os.makedirs("temp", exist_ok=True)
     try:
-        # --- Configuration (Local for this test) ---
-        template_path = "template.png"
-        qr_code_path = "qr.png" # Make sure you have a dummy qr.png for this test
-        font_path = "Poppins-Bold.ttf" # Make sure you have this font file
-        output_path = "test_final_output.png"
-
         name = "Uthkarsh Mandloi"
-        font_size = 60
-        # Manually set positions for the test. Adjust these to match your template.
-        text_position_y = 750
-        qr_position_y = 950
-        qr_size = 350
+        attendee_id = "test-uuid-12345"
+        qr_size = 300 # Using the adjusted size for testing
+        qr_corner_radius = 40
+        
+        qr_path = "temp/test_qr.png"
+        ticket_path = "test_final_output.png"
 
-        # --- Test Logic ---
-        print(f"Loading template: {template_path}")
-        base_img = Image.open(template_path).convert("RGBA")
-        draw = ImageDraw.Draw(base_img)
+        print("Generating test QR code...")
+        if not generate_qr_code(attendee_id, qr_path, qr_size, qr_corner_radius):
+            raise Exception("Failed to generate test QR code.")
 
-        print(f"Loading and resizing QR code: {qr_code_path}")
-        qr_code = Image.open(qr_code_path).convert("RGBA")
-        qr_code = qr_code.resize((qr_size, qr_size))
+        print("Generating test ticket image...")
+        if not create_ticket_image(ticket_path, name, qr_path):
+            raise Exception("Failed to create test ticket image.")
 
-        # Center QR code horizontally
-        qr_pos_x = (base_img.width - qr_code.width) / 2
-        print("Pasting QR code onto template...")
-        base_img.paste(qr_code, (int(qr_pos_x), qr_position_y), qr_code)
-
-        print("Drawing text on image...")
-        font = ImageFont.truetype(font_path, font_size)
-
-        # Center text horizontally
-        text_bbox = draw.textbbox((0, 0), name, font=font)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_pos_x = (base_img.width - text_width) / 2
-
-        draw.text((text_pos_x, text_position_y), name, font=font, fill=(0, 0, 0, 255)) # Black text
-
-        print(f"Saving final image to: {output_path}")
-        base_img.save(output_path)
-
-        print(f"✅✅✅ Test successful! Image generated and saved as '{output_path}'.")
+        print(f"✅✅✅ Test successful! Image generated and saved as '{ticket_path}'.")
 
     except FileNotFoundError as e:
-        log_error(f"❌ TEST FAILED: File not found - {e}. Make sure the required files are in the directory.")
+        log_error(f"❌ TEST FAILED: File not found - {e}. Make sure template/font URLs are correct.")
     except Exception as e:
         log_error(f"❌ TEST FAILED: An unexpected error occurred: {e}")
 
@@ -606,14 +566,12 @@ def test_single_ticket_generation():
 if __name__ == '__main__':
     # --- CHOOSE WHICH FUNCTION TO RUN ---
 
-    # Start the simple web server in a background thread
-    # This is useful for health checks in containerized environments
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
 
     # To run the main application that polls the Google Sheet, call main()
     main()
 
-    # To run ONLY the standalone image generation test, comment out main()
+    # To run ONLY the standalone image generation test, uncomment main()
     # and uncomment the line below.
     # test_single_ticket_generation()

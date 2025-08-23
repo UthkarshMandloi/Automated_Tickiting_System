@@ -18,3 +18,5 @@ __pycache__/
 # Ignore .env file
 .env
 .env.*
+
+perameter.py
