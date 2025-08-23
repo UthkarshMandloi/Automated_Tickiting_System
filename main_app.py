@@ -5,18 +5,6 @@
 # credentials for authentication, removing the need for browser-based login.
 # It can download assets like templates and fonts directly from URLs.
 # It also runs a simple web server for status checks and data retrieval.
-#
-# To check the status from your terminal while the script is running,
-# you can use one of the following commands (assuming the default port 8000):
-#
-# On macOS/Linux (or Windows with Git Bash/WSL):
-# curl http://localhost:8000               # Basic status
-# curl http://localhost:8000/attendees       # List all registered attendees
-# curl http://localhost:8000/unsent          # List attendees with unsent emails
-# curl http://localhost:8000/errors          # List recent errors
-#
-# On Windows (using PowerShell):
-# Invoke-WebRequest -Uri http://localhost:8000
 # -----------------------------------------------------------------------------
 
 # =============================================================================
@@ -51,16 +39,6 @@ from email.mime.image import MIMEImage
 # Custom modules (ensure these files are in the same directory)
 import config
 from mongo_helper import MongoDBClient
-
-# Optional: Tesseract for OCR-based placeholder detection
-try:
-    import pytesseract
-    if config.TESSERACT_CMD_PATH:
-        pytesseract.pytesseract.tesseract_cmd = config.TESSERACT_CMD_PATH
-except ImportError:
-    pytesseract = None
-    print("⚠️ Warning: pytesseract library not found. Automated placeholder detection will be disabled.")
-
 
 # =============================================================================
 #  Part 2: Main Application Code
@@ -116,8 +94,8 @@ class StatusHandler(http.server.SimpleHTTPRequestHandler):
     def send_attendees_response(self):
         """Fetches and returns all attendees from MongoDB."""
         try:
+            # CORRECTED: Use find_attendees_by_query with an empty dict to get all
             attendees = mongo_client.find_attendees_by_query({})
-            # Sanitize the data for JSON serialization
             sanitized_attendees = []
             for attendee in attendees:
                 attendee['_id'] = str(attendee['_id']) # Convert ObjectId to string
@@ -136,7 +114,6 @@ class StatusHandler(http.server.SimpleHTTPRequestHandler):
     def send_unsent_response(self):
         """Fetches and returns attendees with unsent emails."""
         try:
-            # Find attendees where email status is not 'Sent'
             unsent = mongo_client.find_attendees_by_query(
                 {config.COL_EMAIL_STATUS: {"$ne": "Sent"}}
             )
@@ -194,7 +171,7 @@ def get_spreadsheet_id_from_url(url: str) -> str:
         raise ValueError(f"Invalid Google Sheet URL: '{url}'. Could not extract Spreadsheet ID.")
 
 def get_folder_id_from_url(url: str) -> str:
-    """Extracts the Google Drive Folder ID from its URL, ignoring query parameters."""
+    """Extracts the Google Drive Folder ID from its URL."""
     try:
         parsed_url = urlparse(url)
         path = parsed_url.path
@@ -273,21 +250,9 @@ def generate_qr_code(data: str, file_path: str, size: int, corner_radius: int) -
 def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
     """Creates a personalized ticket by overlaying a name and QR code onto a template."""
     try:
-        # --- TYPOGRAPHY & STYLE SETTINGS ---
-        FONT_URL = "https://drive.google.com/file/d/1nbAEoAi7vaGJf4nkx6gjaxwKplzKWFhd/view?usp=sharing"
-        TEXT_COLOR = (17, 17, 17) 
-        # --- ADJUSTED: Reduced font size to prevent wrapping ---
-        FONT_SIZE = 30
-        
-        # --- MANUAL POSITIONING (Adjust as needed) ---
-        # --- ADJUSTED: Centered the name and QR code horizontally ---
-        NAME_POSITION = (51, 887)
-        QR_CODE_POSITION = (184, 394)
-
-
-        # --- Download assets ---
+        # --- Download assets using paths from config.py ---
         local_template_path = download_file(config.TICKET_TEMPLATE_EMPTY_PATH, "temp/template.png")
-        local_font_path = download_file(FONT_URL, "temp/Inter-Bold.ttf")
+        local_font_path = download_file(config.FONT_PATH, "temp/Inter-Bold.ttf")
         
         if not local_template_path or not local_font_path:
             log_error("Critical error: Font or template download failed. Cannot create ticket.")
@@ -297,30 +262,29 @@ def create_ticket_image(output_path: str, name: str, qr_code_path: str) -> bool:
         draw = ImageDraw.Draw(base_img)
 
         try:
-            font = ImageFont.truetype(local_font_path, FONT_SIZE)
+            # Use font size from config
+            font = ImageFont.truetype(local_font_path, config.DETECTED_FONT_SIZE)
         except IOError:
-            print(f"⚠️ Warning: Font from URL '{FONT_URL}' could not be loaded. Using default font.")
+            print(f"⚠️ Warning: Font from URL '{config.FONT_PATH}' could not be loaded. Using default font.")
             font = ImageFont.load_default()
 
         # --- Position and draw the name with the new style ---
         text_bbox = draw.textbbox((0, 0), name, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         
-        text_x = NAME_POSITION[0]
-        if text_x == 'center':
-            text_x = (base_img.width - text_width) / 2
-        
-        text_y = NAME_POSITION[1]
-        draw.text((text_x, text_y), name, font=font, fill=TEXT_COLOR)
+        # Center the text horizontally
+        text_x = (base_img.width - text_width) / 2
+        # Use Y position from config
+        text_y = config.DETECTED_NAME_TEXT_Y_POS
+        draw.text((text_x, text_y), name, font=font, fill=config.TEXT_COLOR)
 
         # --- Position and paste the QR code ---
         qr_img = Image.open(qr_code_path).convert("RGBA")
         
-        qr_x = QR_CODE_POSITION[0]
-        if qr_x == 'center':
-            qr_x = (base_img.width - qr_img.width) / 2
-            
-        qr_y = QR_CODE_POSITION[1]
+        # Center the QR code horizontally
+        qr_x = (base_img.width - qr_img.width) / 2
+        # Use Y position from config
+        qr_y = config.DETECTED_QR_CODE_Y_POS
         
         base_img.paste(qr_img, (int(qr_x), int(qr_y)), qr_img)
 
@@ -346,6 +310,7 @@ def send_ticket_email(recipient_email: str, recipient_name: str, ticket_file_pat
         msg['From'] = config.SENDER_EMAIL
         msg['To'] = recipient_email
         msg['Subject'] = "Your Event E-Ticket is Here!"
+        # CORRECTED: Send email as HTML
         msg.attach(MIMEText(email_body, 'html'))
 
         with open(ticket_file_path, 'rb') as fp:
@@ -480,9 +445,8 @@ def main():
                 qr_filename = f"{name.replace(' ', '_')}_QR.png"
                 qr_path = os.path.join("temp", qr_filename)
                 
-                # --- ADJUSTED: Reduced QR code size to 300px. You can also set this in your config.py ---
-                qr_code_size = 329
-                if not generate_qr_code(attendee_id, qr_path, qr_code_size, 30):
+                # Use QR code size from config and set a corner radius
+                if not generate_qr_code(attendee_id, qr_path, config.DETECTED_QR_CODE_TARGET_SIZE, 30):
                     update_sheet_cell(sheets_service, spreadsheet_id, config.MAIN_SHEET_NAME, i, COLUMN_INDICES[config.COL_TICKET_STATUS], "Failed (QR)")
                     continue
 
@@ -524,54 +488,13 @@ def main():
             time.sleep(config.POLLING_INTERVAL_SECONDS * 2)
 
 # =============================================================================
-#  Part 3: Test Code
-# =============================================================================
-
-def test_single_ticket_generation():
-    """
-    A standalone function to test only the image generation logic.
-    This is useful for quickly verifying the template, font, and positioning.
-    """
-    print("\n--- 🧪 Running Standalone Image Generation Test ---")
-    os.makedirs("temp", exist_ok=True)
-    try:
-        name = "Uthkarsh Mandloi"
-        attendee_id = "test-uuid-12345"
-        qr_size = 300 # Using the adjusted size for testing
-        qr_corner_radius = 40
-        
-        qr_path = "temp/test_qr.png"
-        ticket_path = "test_final_output.png"
-
-        print("Generating test QR code...")
-        if not generate_qr_code(attendee_id, qr_path, qr_size, qr_corner_radius):
-            raise Exception("Failed to generate test QR code.")
-
-        print("Generating test ticket image...")
-        if not create_ticket_image(ticket_path, name, qr_path):
-            raise Exception("Failed to create test ticket image.")
-
-        print(f"✅✅✅ Test successful! Image generated and saved as '{ticket_path}'.")
-
-    except FileNotFoundError as e:
-        log_error(f"❌ TEST FAILED: File not found - {e}. Make sure template/font URLs are correct.")
-    except Exception as e:
-        log_error(f"❌ TEST FAILED: An unexpected error occurred: {e}")
-
-
-# =============================================================================
 #  Part 4: Script Execution
 # =============================================================================
 
 if __name__ == '__main__':
-    # --- CHOOSE WHICH FUNCTION TO RUN ---
-
+    # Start the web server in a background thread
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
 
-    # To run the main application that polls the Google Sheet, call main()
+    # Run the main application loop
     main()
-
-    # To run ONLY the standalone image generation test, uncomment main()
-    # and uncomment the line below.
-    # test_single_ticket_generation()

@@ -37,20 +37,19 @@ COL_EMAIL = os.getenv("COL_EMAIL", "Email")
 COL_TICKET_STATUS = os.getenv("COL_TICKET_STATUS", "Ticket Status")
 COL_EMAIL_STATUS = os.getenv("COL_EMAIL_STATUS", "Email Status")
 
-# --- 5. Ticket Design & Automated Positioning ---
-# These values are not secrets, so they can remain here.
-# They are managed by the script itself.
-SHOULD_DETECT_COORDINATES_ON_STARTUP = True
-TICKET_TEMPLATE_WITH_TAGS_PATH = os.getenv("TICKET_TEMPLATE_WITH_TAGS_PATH")
-TEXT_COLOR = (0, 0, 0, 255)
+# Add this line to your config.py
+TEXT_COLOR = (17, 17, 17) # This corresponds to the color #111111
 
-MANUAL_QR_SIZE = 350
+# In your config.py or Render Environment Variables
+FONT_PATH = "https://drive.google.com/file/d/1nbAEoAi7vaGJf4nkx6gjaxwKplzKWFhd/view?usp=sharing"
+DETECTED_FONT_SIZE = 55
+DETECTED_QR_CODE_TARGET_SIZE = 300
 
-# Auto-populated values
-DETECTED_NAME_TEXT_Y_POS = 750
-DETECTED_FONT_SIZE = 60
-DETECTED_QR_CODE_Y_POS = 950
-DETECTED_QR_CODE_TARGET_SIZE = 350
+# In your config.py or Render Environment Variables
+DETECTED_NAME_TEXT_X_POS = 51  # The X-coordinate for the name
+DETECTED_NAME_TEXT_Y_POS = 887 # The Y-coordinate for the name
+DETECTED_QR_CODE_X_POS = 184   # The X-coordinate for the QR code
+DETECTED_QR_CODE_Y_POS = 394   # The Y-coordinate for the QR code
 
 # --- 6. MongoDB Configuration ---
 MONGO_URI = os.getenv("MONGO_URI")
